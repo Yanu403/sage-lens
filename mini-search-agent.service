@@ -1,0 +1,16 @@
+[Unit]
+Description=Mini AI Search Agent Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/projects/mini-search-agent/bot.py
+WorkingDirectory=/root/projects/mini-search-agent
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/root/projects/mini-search-agent/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

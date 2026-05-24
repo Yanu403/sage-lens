@@ -1,0 +1,7 @@
+python-telegram-bot>=20.8
+httpx>=0.28
+openai>=1.0
+tavily-python>=0.5
+trafilatura>=1.12
+python-dotenv>=1.0
+aiosqlite>=0.20
