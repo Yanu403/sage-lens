@@ -1,10 +1,10 @@
 [Unit]
-Description=Mini AI Search Agent Telegram Bot
+Description=Sage Lens — AI Search Agent
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /root/projects/mini-search-agent/bot.py
+ExecStart=/root/projects/mini-search-agent/venv/bin/python3 /root/projects/mini-search-agent/bot.py
 WorkingDirectory=/root/projects/mini-search-agent
 Restart=on-failure
 RestartSec=5
