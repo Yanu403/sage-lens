@@ -1,14 +1,14 @@
 [Unit]
-Description=Sage Lens — AI Search Agent
+Description=Sage Lens — AI Search Agent for Telegram
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/root/projects/mini-search-agent/venv/bin/python3 /root/projects/mini-search-agent/bot.py
-WorkingDirectory=/root/projects/mini-search-agent
+ExecStart=/root/projects/sage-lens/venv/bin/python3 /root/projects/sage-lens/bot.py
+WorkingDirectory=/root/projects/sage-lens
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=/root/projects/mini-search-agent/.env
+EnvironmentFile=/root/projects/sage-lens/.env
 StandardOutput=journal
 StandardError=journal
 
