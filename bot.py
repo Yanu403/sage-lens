@@ -250,9 +250,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── Startup & Shutdown ───────────────────────────────────
 
+async def _periodic_rate_cleanup(rl: RateLimiter) -> None:
+    """Background task: prune expired rate-limit rows every hour."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            removed = await rl.cleanup()
+            if removed:
+                log.info("Rate limiter cleanup: %d rows removed", removed)
+        except Exception as e:
+            log.debug("Rate limiter cleanup error: %s", e)
+
+
 async def post_init(app: Application) -> None:
     await cache.init()
     await rate_limiter.init()
+    asyncio.create_task(_periodic_rate_cleanup(rate_limiter))
     log.info("Cache + Rate limiter initialized")
 
 

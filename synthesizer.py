@@ -81,6 +81,54 @@ def _build_reason_prompt(language: str, query: str) -> list[dict]:
     ]
 
 
+def _fix_citations(text: str) -> str:
+    """Fix malformed citations from the model.
+
+    Handles cases like:
+    - 'Joko Widodo 15' → 'Joko Widodo [15]'
+    - 'Presiden 4' → 'Presiden [4]'
+    - 'text 1,2,3' → 'text [1],[2],[3]'
+    Does NOT touch already-correct '[15]' or numbers in normal sentences.
+    """
+    import re
+
+    def _wrap_if_citation(match: re.Match) -> str:
+        """Wrap matched number in brackets if it looks like a citation."""
+        prefix = match.group(1)  # character before the space+number
+        num = int(match.group(2))
+        # Only wrap if preceded by a letter (not digit, not bracket)
+        if prefix.isalpha() and num <= 30:
+            return f'{prefix} [{num}]'
+        return match.group(0)
+
+    # Fix bare numbers after words: "Widodo 15." → "Widodo [15]."
+    # Captures: (char before space)(1-2 digit number)(boundary)
+    text = re.sub(
+        r'([a-zA-Z]) (\d{1,2})(?=[\s,.\);:。、]|$)',
+        _wrap_if_citation,
+        text,
+    )
+
+    # Fix comma-separated bare citations: "sekarang 1,2,3" → "sekarang [1],[2],[3]"
+    # Step 1: first number after word
+    text = re.sub(
+        r'([a-zA-Z\]\s])(\d{1,2})(?=,\d)',
+        lambda m: f'{m.group(1)}[{m.group(2)}]' if int(m.group(2)) <= 30 else m.group(0),
+        text,
+    )
+    # Step 2: numbers after commas in citation chains
+    text = re.sub(
+        r'(,)(\d{1,2})(?=[\s,.\);:。、]|$)',
+        lambda m: f'{m.group(1)}[{m.group(2)}]' if int(m.group(2)) <= 30 else m.group(0),
+        text,
+    )
+
+    # Fix 'text [1] [2]' → 'text [1][2]' (remove space between consecutive citations)
+    text = re.sub(r'\]\s+\[', '][', text)
+
+    return text
+
+
 async def _call_mimo(messages: list[dict], extra_body: dict | None = None) -> str:
     """Single MiMo API call."""
     client = _get_client()
@@ -111,11 +159,33 @@ async def synthesize(
     else:
         messages = _build_reason_prompt(language, query)
 
+    # Detect content-filter / safety rejections from the model
+    _SAFETY_PATTERNS = [
+        "high risk",
+        "rejected",
+        "safety",
+        "harmful",
+        "inappropriate",
+        "blocked",
+        "refused",
+    ]
+
     last_error = None
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
-            return await _call_mimo(messages)
+            answer = await _call_mimo(messages)
+
+            # Check if the model returned a safety rejection instead of an answer
+            answer_lower = answer.lower()
+            if any(pat in answer_lower for pat in _SAFETY_PATTERNS) and len(answer) < 200:
+                log.warning("MiMo returned safety rejection: %s", answer[:100])
+                return (
+                    "⚠️ Model AI menolak menjawab pertanyaan ini karena dianggap sensitif. "
+                    "Coba rephrase pertanyaanmu atau gunakan kata yang lebih netral."
+                )
+
+            return _fix_citations(answer)
         except Exception as e:
             last_error = e
             error_str = str(e).lower()
