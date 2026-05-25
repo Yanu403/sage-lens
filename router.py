@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+
 from openai import AsyncOpenAI
 
 from config import GEMINI_API_KEY, GEMINI_MODEL, GEMINI_BASE_URL
@@ -56,7 +58,6 @@ async def classify(query: str) -> dict:
         )
         raw = resp.choices[0].message.content.strip()
         # Strip <thought>...</thought> blocks (Gemma thinking mode)
-        import re
         raw = re.sub(r"<thought>.*?</thought>", "", raw, flags=re.DOTALL).strip()
         # Strip markdown fences if present
         if raw.startswith("```"):

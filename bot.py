@@ -1,12 +1,19 @@
-"""Mini AI Search Agent — Telegram Bot Entry Point."""
+"""Sage Lens — AI Search Agent Telegram Bot (Entry Point)."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
-from typing import Optional
 
+from openai import (
+    AuthenticationError,
+    RateLimitError,
+    APITimeoutError,
+    APIConnectionError,
+    APIStatusError,
+)
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -19,7 +26,7 @@ from telegram.constants import ChatAction, ParseMode
 
 import config
 from cache import Cache
-from rate_limiter import check_rate_limit
+from rate_limiter import RateLimiter
 from router import classify
 from search import search, enrich_sources
 from synthesizer import synthesize
@@ -31,23 +38,32 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("mini-search")
+log = logging.getLogger("sage-lens")
 
-# ── Global cache instance ────────────────────────────────
+# ── Global instances ─────────────────────────────────────
 cache = Cache()
-
+rate_limiter = RateLimiter()
 
 # ── Helpers ──────────────────────────────────────────────
 
+_TRUNCATE_LEN = 50
+
+
+def _t(s: str) -> str:
+    """Truncate string for logging."""
+    return s[:_TRUNCATE_LEN] + "..." if len(s) > _TRUNCATE_LEN else s
+
+
 async def send_typing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """Send typing indicator."""
     try:
         await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     except Exception:
         pass
 
 
-async def typing_loop(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, stop: asyncio.Event) -> None:
+async def typing_loop(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, stop: asyncio.Event
+) -> None:
     """Send typing indicator every 4 seconds until stop event is set."""
     while not stop.is_set():
         await send_typing(ctx, chat_id)
@@ -57,12 +73,20 @@ async def typing_loop(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, stop: asynci
             break
 
 
+def _strip_mention(text: str, bot_username: str | None) -> str:
+    """Remove @botusername mention from the start or anywhere in the message."""
+    if not bot_username:
+        return text
+    # Remove @username (case-insensitive)
+    cleaned = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
 # ── Command Handlers ─────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command."""
     welcome = (
-        "🔍 *Mini AI Search Agent*\n\n"
+        "🔮 *Sage Lens*\n\n"
         "Kirim pertanyaan apapun, dan aku akan mencari di web "
         "lalu memberikan jawaban dengan sumber.\n\n"
         "*Contoh:*\n"
@@ -77,9 +101,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /help command."""
     help_text = (
-        "🔍 *Cara Pakai:*\n\n"
+        "🔮 *Cara Pakai:*\n\n"
         "Kirim pertanyaan atau topik yang ingin dicari. "
         "Bot akan:\n"
         "1. Menganalisis pertanyaanmu\n"
@@ -104,38 +127,47 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message or not update.message.text:
         return
 
-    # In groups, only respond to @mentions or replies to bot
-    if update.effective_chat.type != "private":
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    raw_text = update.message.text.strip()
+
+    if not raw_text:
+        return
+
+    # ── Group chat: only respond to @mentions or replies to bot ──
+    is_group = update.effective_chat.type != "private"
+    if is_group:
         bot_username = ctx.bot.username
-        text = update.message.text
-        if f"@{bot_username}" not in text and not (
+        has_mention = f"@{bot_username}" in raw_text
+        is_reply_to_bot = (
             update.message.reply_to_message
             and update.message.reply_to_message.from_user
             and update.message.reply_to_message.from_user.is_bot
-        ):
+        )
+        if not has_mention and not is_reply_to_bot:
             return
-
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    query = update.message.text.strip()
-
-    if not query:
-        return
+        # Strip @mention from query text
+        query = _strip_mention(raw_text, bot_username)
+        if not query:
+            await update.message.reply_text("Ketik pertanyaan setelah mention ya 🔮")
+            return
+    else:
+        query = raw_text
 
     # ── Rate limit ───────────────────────────────────────
-    allowed, remaining = check_rate_limit(user_id)
+    allowed, remaining = await rate_limiter.check(user_id)
     if not allowed:
         await update.message.reply_text(
-            "⚠️ Kamu sudah mencapai batas {limit} query per jam. "
-            "Coba lagi nanti ya.".format(limit=config.RATE_LIMIT_PER_HOUR)
+            f"⚠️ Kamu sudah mencapai batas {config.RATE_LIMIT_PER_HOUR} query per jam. "
+            "Coba lagi nanti ya."
         )
         return
 
     # ── Check cache ──────────────────────────────────────
     cached = await cache.get(query)
     if cached:
-        log.info("Cache hit for query: %s", query[:50])
-        messages = format_response(cached["response"], cached["sources"])
+        log.info("Cache hit: %s", _t(query))
+        messages = format_response(cached["response"], cached.get("sources"))
         for msg in messages:
             await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
         return
@@ -151,10 +183,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         search_query = classification["search_query"] or query
         language = classification["language"]
 
-        log.info("Query: %s → intent=%s, search=%s", query[:50], intent, search_query[:50])
+        log.info("Query: %s → intent=%s search=%s", _t(query), intent, _t(search_query))
 
         # ── Step 2: Search (if needed) ───────────────────
-        sources = []
+        sources: list[dict] = []
         if intent in ("search", "search_reason"):
             sources = await search(search_query)
             if sources:
@@ -169,18 +201,42 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         )
 
         # ── Step 4: Format & send ────────────────────────
-        messages = format_response(answer, sources if sources else None)
+        messages = format_response(answer, sources)
         for msg in messages:
             await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
         # ── Step 5: Cache the result ─────────────────────
         await cache.put(query, answer, sources, intent)
-        log.info("Cached response for: %s", query[:50])
+        log.info("Cached: %s", _t(query))
+
+    except AuthenticationError as e:
+        log.error("API authentication failed: %s", e)
+        await update.message.reply_text(
+            "❌ Konfigurasi API bermasalah. Hubungi admin."
+        )
+
+    except RateLimitError as e:
+        log.warning("API rate limit hit: %s", e)
+        await update.message.reply_text(
+            "⚠️ Server sedang sibuk. Coba lagi dalam beberapa menit."
+        )
+
+    except (APITimeoutError, APIConnectionError) as e:
+        log.warning("API connection/timeout error: %s", e)
+        await update.message.reply_text(
+            "🌐 Koneksi ke server AI terputus. Coba lagi nanti."
+        )
+
+    except APIStatusError as e:
+        log.error("API status error %s: %s", e.status_code, e)
+        await update.message.reply_text(
+            f"❌ Server AI mengembalikan error ({e.status_code}). Coba lagi nanti."
+        )
 
     except Exception as e:
-        log.error("Pipeline error for query '%s': %s", query[:50], e, exc_info=True)
+        log.error("Unexpected error for query '%s': %s", _t(query), e, exc_info=True)
         await update.message.reply_text(
-            "❌ Terjadi error saat memproses pertanyaanmu. Coba lagi nanti."
+            "❌ Terjadi error yang tidak terduga. Coba lagi nanti."
         )
 
     finally:
@@ -195,15 +251,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 # ── Startup & Shutdown ───────────────────────────────────
 
 async def post_init(app: Application) -> None:
-    """Initialize cache after bot starts."""
     await cache.init()
-    log.info("Cache initialized at %s", config.CACHE_DB_PATH)
+    await rate_limiter.init()
+    log.info("Cache + Rate limiter initialized")
 
 
 async def post_shutdown(app: Application) -> None:
-    """Close cache on shutdown."""
     await cache.close()
-    log.info("Cache closed")
+    await rate_limiter.close()
+    log.info("Cache + Rate limiter closed")
 
 
 # ── Main ─────────────────────────────────────────────────
@@ -213,9 +269,10 @@ def main() -> None:
         log.error("TELEGRAM_BOT_TOKEN not set in .env")
         sys.exit(1)
 
-    log.info("Starting Mini AI Search Agent...")
-    log.info("Gemma model: %s @ %s", config.GEMINI_MODEL, config.GEMINI_BASE_URL)
-    log.info("MiMo model: %s @ %s", config.MIMO_MODEL, config.MIMO_BASE_URL)
+    log.info("Starting Sage Lens...")
+    log.info("Gemma: %s @ %s", config.GEMINI_MODEL, config.GEMINI_BASE_URL)
+    log.info("MiMo:  %s @ %s", config.MIMO_MODEL, config.MIMO_BASE_URL)
+    log.info("Mode:  %s", config.BOT_MODE)
 
     app = (
         Application.builder()
@@ -230,11 +287,21 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Run with polling
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    if config.BOT_MODE == "webhook":
+        log.info("Webhook mode: %s", config.WEBHOOK_URL)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=config.WEBHOOK_PORT,
+            url_path=config.TELEGRAM_BOT_TOKEN,
+            webhook_url=f"{config.WEBHOOK_URL}/{config.TELEGRAM_BOT_TOKEN}",
+            drop_pending_updates=True,
+        )
+    else:
+        log.info("Polling mode")
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
 
 
 if __name__ == "__main__":

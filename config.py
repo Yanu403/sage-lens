@@ -11,6 +11,12 @@ load_dotenv(_env_path)
 # ── Telegram ─────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
+# ── Bot Mode ─────────────────────────────────────────────
+# "polling" (default) or "webhook"
+BOT_MODE = os.getenv("BOT_MODE", "polling")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # e.g. https://sagelens.example.com
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8443"))
+
 # ── LLM — Intent Router (Gemma via Gemini API) ──────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemma-4-26b-a4b-it")

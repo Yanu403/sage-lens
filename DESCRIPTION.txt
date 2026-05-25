@@ -1,0 +1,15 @@
+Sage Lens is an AI-powered search agent built as a Telegram bot that leverages MiMo v2.5 Pro as its core reasoning and synthesis engine.
+
+The system implements a multi-model architecture where Gemma 4 (via Google Gemini API) handles lightweight intent classification, while MiMo v2.5 Pro performs deep reasoning and generates structured answers with inline source citations from real-time web search results.
+
+Key technical highlights:
+- MiMo v2.5 Pro serves as the synthesis backbone, processing web-scraped content and generating coherent, cited responses
+- Real-time web search via Tavily API with trafilatura content extraction
+- Async SQLite caching with TTL for query deduplication
+- Per-user rate limiting with sliding window algorithm
+- Multi-language support — responds in the user's language
+
+The project is fully open-source and demonstrates practical MiMo integration in a production-ready Telegram bot that anyone can deploy. It showcases MiMo's strength in multi-step reasoning: reading multiple sources, resolving conflicting information, and producing accurate summaries with proper attribution.
+
+GitHub: https://github.com/Yanu403/sage-lens
+Live bot: @sagelens_bot on Telegram
