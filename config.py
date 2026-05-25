@@ -25,13 +25,18 @@ GEMINI_BASE_URL = os.getenv(
     "https://generativelanguage.googleapis.com/v1beta/openai",
 )
 
-# ── LLM — Synthesis (MiMo) ──────────────────────────────
-MIMO_API_KEY = os.getenv("MIMO_API_KEY", "")
-MIMO_MODEL = os.getenv("MIMO_MODEL", "mimo-v2.5-pro")
-MIMO_BASE_URL = os.getenv(
-    "MIMO_BASE_URL",
-    "https://token-plan-sgp.xiaomimimo.com/v1",
+# ── LLM — Synthesis (provider-agnostic, OpenAI-compatible) ──
+# Works with: MiMo, GPT, DeepSeek, Kimi, Claude (via OpenRouter), etc.
+SYNTHESIS_API_KEY = os.getenv("SYNTHESIS_API_KEY", os.getenv("MIMO_API_KEY", ""))
+SYNTHESIS_MODEL = os.getenv("SYNTHESIS_MODEL", os.getenv("MIMO_MODEL", "mimo-v2.5-pro"))
+SYNTHESIS_BASE_URL = os.getenv(
+    "SYNTHESIS_BASE_URL",
+    os.getenv("MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"),
 )
+
+# ── Conversation Memory ─────────────────────────────────
+CONVERSATION_MAX_HISTORY = int(os.getenv("CONVERSATION_MAX_HISTORY", "10"))
+CONVERSATION_TTL_SECONDS = int(os.getenv("CONVERSATION_TTL_SECONDS", "600"))
 
 # ── Search ───────────────────────────────────────────────
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")

@@ -26,6 +26,7 @@ from telegram.constants import ChatAction, ParseMode
 
 import config
 from cache import Cache
+from memory import ConversationMemory
 from rate_limiter import RateLimiter
 from router import classify
 from search import search, enrich_sources
@@ -43,6 +44,10 @@ log = logging.getLogger("sage-lens")
 # ── Global instances ─────────────────────────────────────
 cache = Cache()
 rate_limiter = RateLimiter()
+memory = ConversationMemory(
+    max_history=config.CONVERSATION_MAX_HISTORY,
+    ttl=config.CONVERSATION_TTL_SECONDS,
+)
 
 # ── Helpers ──────────────────────────────────────────────
 
@@ -77,7 +82,6 @@ def _strip_mention(text: str, bot_username: str | None) -> str:
     """Remove @botusername mention from the start or anywhere in the message."""
     if not bot_username:
         return text
-    # Remove @username (case-insensitive)
     cleaned = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE)
     return cleaned.strip()
 
@@ -93,9 +97,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• Apa itu restaking di Ethereum?\n"
         "• Siapa pemenang UCL 2026?\n"
         "• Jelaskan konsep zero-knowledge proof\n\n"
+        "Kamu bisa langsung *bertanya lanjutan* dari jawaban sebelumnya — "
+        "aku ingat percakapan kita selama 10 menit.\n\n"
         "Perintah:\n"
         "/start — Pesan ini\n"
-        "/help — Bantuan"
+        "/help — Bantuan\n"
+        "/clear — Hapus riwayat percakapan"
     )
     await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN)
 
@@ -108,16 +115,32 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "1. Menganalisis pertanyaanmu\n"
         "2. Mencari di internet secara real-time\n"
         "3. Merangkum jawaban dengan sitasi\n\n"
+        "*Multi-turn:*\n"
+        "Kamu bisa bertanya lanjutan dari jawaban sebelumnya. "
+        "Contoh:\n"
+        "• Kamu: \"apa itu restaking?\"\n"
+        "• Bot: [jawaban]\n"
+        "• Kamu: \"bagaimana cara mulainya?\"\n"
+        "• Bot: [jawaban yang ngerti konteks]\n\n"
+        "Riwayat otomatis hilang setelah 10 menit idle.\n"
+        "/clear — Hapus riwayat sekarang\n\n"
         "*Fitur:*\n"
         "• Pencarian real-time via Tavily\n"
         "• Jawaban dengan sumber terpercaya\n"
         "• Mendukung bahasa Indonesia & Inggris\n"
         "• Cache untuk respons lebih cepat\n\n"
-        "*Batasan:*\n"
+        f"*Batasan:*\n"
         f"• {config.RATE_LIMIT_PER_HOUR} query per jam per user\n"
-        "• Stateless (tidak ada memori percakapan)"
+        f"• {config.CONVERSATION_MAX_HISTORY} pasang pesan riwayat"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear conversation history for this user."""
+    user_id = update.effective_user.id
+    memory.clear(user_id)
+    await update.message.reply_text("🧹 Riwayat percakapan dihapus. Mulai dari awal!")
 
 
 # ── Main Search Handler ──────────────────────────────────
@@ -146,7 +169,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         )
         if not has_mention and not is_reply_to_bot:
             return
-        # Strip @mention from query text
         query = _strip_mention(raw_text, bot_username)
         if not query:
             await update.message.reply_text("Ketik pertanyaan setelah mention ya 🔮")
@@ -163,14 +185,20 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # ── Check cache ──────────────────────────────────────
-    cached = await cache.get(query)
-    if cached:
-        log.info("Cache hit: %s", _t(query))
-        messages = format_response(cached["response"], cached.get("sources"))
-        for msg in messages:
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-        return
+    # ── Check cache (skip cache if there's conversation context) ──
+    history = memory.get_history(user_id)
+    if not history:
+        # Only cache if no conversation context (stateless query)
+        cached = await cache.get(query)
+        if cached:
+            log.info("Cache hit: %s", _t(query))
+            messages = format_response(cached["response"], cached.get("sources"))
+            for msg in messages:
+                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+            return
+
+    # ── Record user message in memory ────────────────────
+    memory.add_user_message(user_id, query)
 
     # ── Start typing indicator ───────────────────────────
     stop_typing = asyncio.Event()
@@ -193,21 +221,26 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
                 sources = await enrich_sources(sources)
                 log.info("Found %d sources", len(sources))
 
-        # ── Step 3: Synthesis ────────────────────────────
+        # ── Step 3: Synthesis (with conversation history) ──
         answer = await synthesize(
             query=query,
             sources=sources if sources else None,
             language=language,
+            history=history if history else None,
         )
 
-        # ── Step 4: Format & send ────────────────────────
+        # ── Step 4: Record assistant response in memory ──
+        memory.add_assistant_message(user_id, answer)
+
+        # ── Step 5: Format & send ────────────────────────
         messages = format_response(answer, sources)
         for msg in messages:
             await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-        # ── Step 5: Cache the result ─────────────────────
-        await cache.put(query, answer, sources, intent)
-        log.info("Cached: %s", _t(query))
+        # ── Step 6: Cache (only stateless queries) ───────
+        if not history:
+            await cache.put(query, answer, sources, intent)
+            log.info("Cached: %s", _t(query))
 
     except AuthenticationError as e:
         log.error("API authentication failed: %s", e)
@@ -266,7 +299,12 @@ async def post_init(app: Application) -> None:
     await cache.init()
     await rate_limiter.init()
     asyncio.create_task(_periodic_rate_cleanup(rate_limiter))
-    log.info("Cache + Rate limiter initialized")
+    asyncio.create_task(memory.cleanup_loop())
+    log.info(
+        "Cache + Rate limiter + Memory initialized (history: %d pairs, TTL: %ds)",
+        config.CONVERSATION_MAX_HISTORY,
+        config.CONVERSATION_TTL_SECONDS,
+    )
 
 
 async def post_shutdown(app: Application) -> None:
@@ -283,9 +321,9 @@ def main() -> None:
         sys.exit(1)
 
     log.info("Starting Sage Lens...")
-    log.info("Gemma: %s @ %s", config.GEMINI_MODEL, config.GEMINI_BASE_URL)
-    log.info("MiMo:  %s @ %s", config.MIMO_MODEL, config.MIMO_BASE_URL)
-    log.info("Mode:  %s", config.BOT_MODE)
+    log.info("Router:   %s @ %s", config.GEMINI_MODEL, config.GEMINI_BASE_URL)
+    log.info("Synth:    %s @ %s", config.SYNTHESIS_MODEL, config.SYNTHESIS_BASE_URL)
+    log.info("Mode:     %s", config.BOT_MODE)
 
     app = (
         Application.builder()
@@ -298,6 +336,7 @@ def main() -> None:
     # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     if config.BOT_MODE == "webhook":
